@@ -1,6 +1,10 @@
 package disk
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // A 10 GiB GPT disk: a 512 MiB ESP at 1 MiB, a gap, a mounted 4 GiB root,
 // and free space to the end.
@@ -141,6 +145,43 @@ func TestNextPartitionNumberAndLimits(t *testing.T) {
 	d.Table = ""
 	if ok, _ := d.CanAddPartition(); ok {
 		t.Error("no table means no partitions")
+	}
+}
+
+// lsblk leaves PARTN null when udev did not record the partition entry; the
+// number then comes from sysfs, and a number that cannot be read there stops
+// NextPartitionNumber from guessing.
+func TestPartitionNumberFromSysfs(t *testing.T) {
+	old := sysfsBlock
+	sysfsBlock = t.TempDir()
+	defer func() { sysfsBlock = old }()
+	if err := os.MkdirAll(filepath.Join(sysfsBlock, "sdb1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysfsBlock, "sdb1", "partition"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const js = `{"blockdevices":[
+	 {"name":"sdb","path":"/dev/sdb","type":"disk","size":256355860480,"pttype":"dos","log-sec":512,"partn":null,
+	  "children":[
+	   {"name":"sdb1","path":"/dev/sdb1","type":"part","size":2147483648,"fstype":"vfat","pttype":"dos",
+	    "start":8192,"partn":null,"mountpoints":["/media/usb"]},
+	   {"name":"sdb2","path":"/dev/sdb2","type":"part","size":1048576,"pttype":"dos","start":4202496,"partn":null}
+	  ]}]}`
+	disks, err := Parse([]byte(js))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := disks[0]
+	if d.Partition(1) == nil || d.Partition(1).Name != "sdb1" {
+		t.Fatalf("sdb1 should be partition 1: %+v", d.Partitions)
+	}
+	if n := d.NextPartitionNumber(); n != 0 {
+		t.Errorf("next = %d with sdb2's number unknown, want 0", n)
+	}
+	d.Partitions = []Partition{*d.Partition(1)}
+	if n := d.NextPartitionNumber(); n != 2 {
+		t.Errorf("next = %d, want 2", n)
 	}
 }
 

@@ -110,10 +110,23 @@ func (r *Runner) Run(ctx context.Context, p *Plan, out func(string)) error {
 		return nil
 	}
 	out("Running: " + p.Title)
-	if os.Geteuid() == 0 {
-		return runDirect(ctx, p, out)
+	mismatch := false
+	watch := func(line string) {
+		if strings.HasPrefix(line, mismatchMarker) {
+			mismatch = true
+		}
+		out(line)
 	}
-	return runInTerminal(ctx, p, out)
+	var err error
+	if os.Geteuid() == 0 {
+		err = runDirect(ctx, p, watch)
+	} else {
+		err = runInTerminal(ctx, p, watch)
+	}
+	if err != nil && mismatch {
+		return ErrTableMismatch
+	}
+	return err
 }
 
 func runDirect(ctx context.Context, p *Plan, out func(string)) error {

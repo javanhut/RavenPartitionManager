@@ -29,6 +29,10 @@ type Plan struct {
 	Summary     string
 	Destructive bool // erases data, as opposed to only rewriting table entries
 	Steps       []Step
+	// Disk is set when the plan first checks that the disk's partition table
+	// is the one shown (see tableCheck), so a failed check can be traced
+	// back to it.
+	Disk string
 }
 
 // TableType is a partition table layout parted can write.
@@ -110,6 +114,9 @@ func Create(d *disk.Disk, req CreateRequest) (*Plan, error) {
 	}
 
 	n := d.NextPartitionNumber()
+	if n == 0 {
+		return nil, fmt.Errorf("could not read the partition numbers on %s, so the new partition's number cannot be predicted", d.Path)
+	}
 	path := d.PartitionPath(n)
 	end := req.Start + req.Size - 1 // parted's end is inclusive
 
@@ -129,7 +136,7 @@ func Create(d *disk.Disk, req CreateRequest) (*Plan, error) {
 	mkpart = append(mkpart, fmt.Sprintf("%dB", req.Start), fmt.Sprintf("%dB", end))
 
 	desc := fmt.Sprintf("Create partition %d (%s)", n, disk.HumanSize(req.Size))
-	steps := []Step{{Desc: desc, Argv: mkpart}}
+	steps := []Step{tableCheck(d), {Desc: desc, Argv: mkpart}}
 	if req.ESP {
 		flag := "esp"
 		if d.Table != "gpt" {
@@ -159,6 +166,7 @@ func Create(d *disk.Disk, req CreateRequest) (*Plan, error) {
 		Title:   fmt.Sprintf("New partition on %s", d.Path),
 		Summary: summary,
 		Steps:   steps,
+		Disk:    d.Path,
 	}, nil
 }
 
@@ -182,9 +190,51 @@ func Delete(d *disk.Disk, p *disk.Partition) (*Plan, error) {
 		Summary:     fmt.Sprintf("%s (%s%s) will be removed and everything on it lost.", p.Path, disk.HumanSize(p.Size), fsSuffix(p)),
 		Destructive: true,
 		Steps: []Step{
+			tableCheck(d),
 			{Desc: fmt.Sprintf("Remove partition %d", p.Number), Argv: []string{"parted", "--script", d.Path, "rm", strconv.Itoa(p.Number)}},
 			settle(),
 		},
+		Disk: d.Path,
+	}, nil
+}
+
+// ReloadTable has the kernel read the disk's partition table again, dropping
+// partitions it still holds from an older table and adding the ones on the
+// disk. The kernel only re-reads a disk none of whose partitions is in use,
+// so whatever is mounted on it is unmounted first. Nothing on the disk is
+// written.
+func ReloadTable(d *disk.Disk) (*Plan, error) {
+	if len(d.Mountpoints) > 0 || len(d.Holders) > 0 {
+		return nil, fmt.Errorf("%s itself is in use", d.Path)
+	}
+	var steps []Step
+	var mounted []string
+	for i := range d.Partitions {
+		p := &d.Partitions[i]
+		if len(p.Holders) > 0 {
+			return nil, fmt.Errorf("%s is used by %s; close or deactivate that first", p.Path, strings.Join(p.Holders, ", "))
+		}
+		if len(p.Mountpoints) > 0 {
+			u, err := Unmount(p)
+			if err != nil {
+				return nil, err
+			}
+			steps = append(steps, u.Steps...)
+			mounted = append(mounted, p.Path)
+		}
+	}
+	steps = append(steps,
+		Step{Desc: "Re-read the partition table", Argv: []string{"blockdev", "--rereadpt", d.Path}},
+		settle(),
+	)
+	summary := fmt.Sprintf("The partitions the kernel uses for %s are replaced with the ones in the partition table on the disk. Nothing on the disk is changed.", d.Path)
+	if len(mounted) > 0 {
+		summary += fmt.Sprintf(" %s is unmounted first; files open from it must be closed.", strings.Join(mounted, ", "))
+	}
+	return &Plan{
+		Title:   fmt.Sprintf("Re-read the partition table of %s", d.Path),
+		Summary: summary,
+		Steps:   steps,
 	}, nil
 }
 
@@ -327,7 +377,7 @@ func Resize(d *disk.Disk, p *disk.Partition, newSize uint64) (*Plan, error) {
 	}
 	tell := Step{Desc: "Tell the kernel about the new size", Argv: []string{"partx", "--update", "--nr", strconv.Itoa(p.Number), d.Path}}
 
-	var steps []Step
+	steps := []Step{tableCheck(d)}
 	switch {
 	case fs.whole != nil:
 		steps = append(steps, fs.whole(d.Path, p.Number, newSize)...)
@@ -350,6 +400,7 @@ func Resize(d *disk.Disk, p *disk.Partition, newSize uint64) (*Plan, error) {
 		// so can an interrupted FAT resize, which rewrites the FAT either way.
 		Destructive: shrinking || fs.whole != nil,
 		Steps:       steps,
+		Disk:        d.Path,
 	}, nil
 }
 
@@ -368,6 +419,44 @@ func fitsInFree(d *disk.Disk, start, size uint64) bool {
 	}
 	return false
 }
+
+// tableCheck is the first step of every plan that edits single entries of a
+// partition table. The window shows the kernel's view of the disk, while
+// parted, sfdisk and fatresize edit the table on the disk. The two part ways
+// when the table is rewritten while a partition on it is in use: the kernel
+// keeps the old partition until it is free. Editing a table the window does
+// not show would put a partition over a mounted one or remove the wrong one,
+// so the plan stops unless every entry on the disk (number, start and size in
+// 512-byte sectors) is the one shown. The kernel reports an extended
+// partition as a sector or two, so only its start is compared.
+func tableCheck(d *disk.Disk) Step {
+	var want []string
+	for _, p := range d.Partitions {
+		size := strconv.FormatUint(p.Size/512, 10)
+		if p.Extended() {
+			size = "*"
+		}
+		want = append(want, fmt.Sprintf("%d:%d:%s", p.Number, p.Start/512, size))
+	}
+	msg := fmt.Sprintf("%s the partition table on %s is not the one the kernel is using; it was changed while a partition on it was in use. "+
+		"Nothing was changed. Unmount everything on %s and re-read its partition table, then try again.", mismatchMarker, d.Path, d.Path)
+	script := `p=$(partx -g -o NR,START,SECTORS "$1") || exit 1; ` +
+		`t=$(printf '%s\n' "$p" | awk 'NF { printf "%s%s:%s:%s", (n++ ? " " : ""), $1, $2, $3 }'); ` +
+		`case "$t" in $2) ;; *) echo "$3" >&2; exit 1 ;; esac`
+	return Step{
+		Desc: fmt.Sprintf("Check that the partition table on %s is the one shown", d.Path),
+		Argv: []string{"sh", "-c", script, "sh", d.Path, strings.Join(want, " "), msg},
+	}
+}
+
+// mismatchMarker starts the line tableCheck prints when it fails, which is
+// how the runner tells that failure from others.
+const mismatchMarker = "Partition table mismatch:"
+
+// ErrTableMismatch is what Run returns when a plan stopped at its table check,
+// before anything was changed. Re-reading the table (ReloadTable) brings the
+// kernel back in line with the disk.
+var ErrTableMismatch = errors.New("nothing was changed: the partition table on the disk is not the one the kernel is using, because it was changed while a partition on it was in use")
 
 func settle() Step {
 	return Step{Desc: "Wait for the device nodes to update", Argv: []string{"udevadm", "settle"}}

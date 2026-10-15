@@ -6,6 +6,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -620,15 +621,41 @@ func (w *Window) execute(plan *ops.Plan) {
 			w.running = false
 			if err != nil {
 				w.appendLog("Error: " + err.Error())
-				errorDialog(w.parent(), plan.Title+" did not finish", err)
 			}
 			if runner.DryRun {
 				w.updateActions()
 			} else {
 				w.refresh()
 			}
+			switch {
+			case errors.Is(err, ops.ErrTableMismatch):
+				w.offerReload(plan.Title+" did not finish", plan.Disk)
+			case err != nil:
+				errorDialog(w.parent(), plan.Title+" did not finish", err)
+			}
 		})
 	}()
+}
+
+// offerReload follows a plan that stopped because the partition table on the
+// disk is not the one shown, and offers to have the kernel re-read it.
+func (w *Window) offerReload(title, path string) {
+	var dk *disk.Disk
+	for i := range w.disks {
+		if w.disks[i].Path == path {
+			dk = &w.disks[i]
+		}
+	}
+	if dk == nil {
+		errorDialog(w.parent(), title, ops.ErrTableMismatch)
+		return
+	}
+	plan, err := ops.ReloadTable(dk)
+	if err != nil {
+		errorDialog(w.parent(), title, fmt.Errorf("%w; it cannot be re-read while %v", ops.ErrTableMismatch, err))
+		return
+	}
+	reloadDialog(w.parent(), title, dk, plan, w.confirm)
 }
 
 func (w *Window) appendLog(line string) {

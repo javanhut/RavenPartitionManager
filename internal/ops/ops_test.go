@@ -2,6 +2,8 @@ package ops
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +62,10 @@ func TestCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := argvs(p)
+	if got[0] != strings.Join(tableCheck(d).Argv, " ") {
+		t.Errorf("the plan should check the table first: %q", got[0])
+	}
+	got = got[1:]
 	want := []string{
 		"parted --script --align optimal /dev/sdz unit B mkpart home ext4 210763776B 263192575B",
 		"udevadm settle",
@@ -90,7 +96,7 @@ func TestDeleteAndFormatRefuseMounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if argvs(p)[0] != "parted --script /dev/sdz rm 1" {
+	if argvs(p)[1] != "parted --script /dev/sdz rm 1" {
 		t.Errorf("steps = %q", argvs(p))
 	}
 }
@@ -116,8 +122,8 @@ func TestResize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gs := argvs(grow)
-	if gs[0] != "sfdisk --no-reread -N 3 /dev/sdz" || grow.Steps[0].Stdin != ",409600\n" {
+	gs := argvs(grow)[1:]
+	if gs[0] != "sfdisk --no-reread -N 3 /dev/sdz" || grow.Steps[1].Stdin != ",409600\n" {
 		t.Errorf("grow should change the table first: %q stdin %q", gs, grow.Steps[0].Stdin)
 	}
 	if gs[len(gs)-1] != "resize2fs /dev/sdz3" {
@@ -128,7 +134,7 @@ func TestResize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss := argvs(shrink)
+	ss := argvs(shrink)[1:]
 	if ss[0] != "e2fsck -f -y /dev/sdz3" || ss[1] != "resize2fs /dev/sdz3 61440K" || !strings.HasPrefix(ss[2], "sfdisk") {
 		t.Errorf("shrink should resize the filesystem before the table: %q", ss)
 	}
@@ -139,6 +145,60 @@ func TestResize(t *testing.T) {
 	d.Partitions[2].FSType = "btrfs"
 	if _, err := Limits(d, p3); err == nil {
 		t.Error("btrfs should not be resizable offline")
+	}
+}
+
+// The check runs against image files, which partx reads like disks.
+func TestTableCheck(t *testing.T) {
+	for _, tool := range []string{"partx", "sfdisk"} {
+		if !toolExists(tool) {
+			t.Skip(tool + " not installed")
+		}
+	}
+	img := filepath.Join(t.TempDir(), "disk.img")
+	run := func(stdin string, argv ...string) error {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%v: %s", err, out)
+		}
+		return nil
+	}
+	if err := run("", "truncate", "-s", "64M", img); err != nil {
+		t.Fatal(err)
+	}
+	// Through Script, so the quoting the plan runs with is tested too.
+	check := func(d *disk.Disk) error {
+		step := tableCheck(d)
+		step.Argv[4] = img
+		return run("", "/bin/sh", "-c", (&Plan{Steps: []Step{step}}).Script())
+	}
+	d := &disk.Disk{Path: "/dev/sdz", Table: "dos", Partitions: []disk.Partition{
+		{Number: 1, Start: disk.MiB, Size: 4 * disk.MiB},
+		{Number: 2, Start: 6 * disk.MiB, Size: 1024, TypeCode: "0x5"},
+		{Number: 5, Start: 7 * disk.MiB, Size: 2 * disk.MiB},
+	}}
+	// What happened to a USB stick: the table was emptied while its first
+	// partition stayed mounted, so the kernel still showed it.
+	if err := run("label: dos\n", "sfdisk", "-q", img); err != nil {
+		t.Fatal(err)
+	}
+	if err := check(d); err == nil || !strings.Contains(err.Error(), "not the one the kernel is using") {
+		t.Errorf("an empty table should not match three partitions: %v", err)
+	}
+	if err := run("start=2048,size=8192,type=c\nstart=12288,size=40960,type=5\nstart=14336,size=4096,type=83\n", "sfdisk", "-q", img); err != nil {
+		t.Fatal(err)
+	}
+	if err := check(d); err != nil {
+		t.Errorf("the same table should match: %v", err)
+	}
+	d.Partitions[0].Size = 3 * disk.MiB
+	if err := check(d); err == nil {
+		t.Error("a partition of another size should not match")
+	}
+	if err := check(&disk.Disk{Path: "/dev/sdz", Table: "dos"}); err == nil {
+		t.Error("a table with partitions should not match an empty one")
 	}
 }
 
@@ -242,7 +302,7 @@ func TestFATResizeWithFatresize(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := argvs(plan)
-	if got[0] != "fatresize --force-yes --partition 1 --size 1069547520 /dev/sdz" {
+	if got[1] != "fatresize --force-yes --partition 1 --size 1069547520 /dev/sdz" {
 		t.Errorf("steps = %q", got)
 	}
 	for _, s := range got {
@@ -316,6 +376,37 @@ func TestRunInTerminal(t *testing.T) {
 	out, err = runLive(t, &Plan{Title: "t", Steps: []Step{{Desc: "fails", Argv: []string{"false"}}}})
 	if err == nil || !strings.Contains(err.Error(), "exit status 1") {
 		t.Errorf("err = %v, want the plan's failure\n%s", err, out)
+	}
+}
+
+// A plan that stops at its table check reports ErrTableMismatch, so the
+// window can offer to re-read the table.
+func TestRunReportsTableMismatch(t *testing.T) {
+	fakeRoot(t, "[ \"$1\" = -- ] && shift\nexec \"$@\"\n")
+	check := Step{Desc: "check", Argv: []string{"sh", "-c", "echo \"$1\" >&2; exit 1", "sh", mismatchMarker + " test"}}
+	out, err := runLive(t, &Plan{Title: "t", Steps: []Step{check}})
+	if !errors.Is(err, ErrTableMismatch) {
+		t.Errorf("err = %v, want ErrTableMismatch\n%s", err, out)
+	}
+	out, err = runLive(t, &Plan{Title: "t", Steps: []Step{{Desc: "fails", Argv: []string{"false"}}}})
+	if errors.Is(err, ErrTableMismatch) {
+		t.Errorf("an ordinary failure is not a mismatch\n%s", out)
+	}
+}
+
+func TestReloadTable(t *testing.T) {
+	d := testDisk()
+	p, err := ReloadTable(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"umount --all-targets /dev/sdz2", "blockdev --rereadpt /dev/sdz", "udevadm settle"}
+	if got := argvs(p); strings.Join(got, "\n") != strings.Join(want, "\n") || p.Destructive {
+		t.Errorf("steps = %q, destructive = %v; want the mounted sdz2 unmounted, then the re-read", got, p.Destructive)
+	}
+	d.Partitions[0].Holders = []string{"luks-sdz1"}
+	if _, err := ReloadTable(d); err == nil {
+		t.Error("a partition holding LUKS cannot be let go by unmounting")
 	}
 }
 

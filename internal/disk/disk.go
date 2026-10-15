@@ -137,10 +137,14 @@ func (d *Disk) CanAddPartition() (bool, string) {
 
 // NextPartitionNumber is the number parted gives the next partition it
 // creates: the lowest unused one (only 1-4 on MBR, since only primaries are
-// created here).
+// created here). It is 0 when a partition's own number is unknown, since the
+// lowest free number cannot be told then.
 func (d *Disk) NextPartitionNumber() int {
 	used := map[int]bool{}
 	for _, p := range d.Partitions {
+		if p.Number <= 0 {
+			return 0
+		}
 		used[p.Number] = true
 	}
 	for n := 1; ; n++ {

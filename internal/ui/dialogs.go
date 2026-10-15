@@ -221,6 +221,17 @@ func errorDialog(parent *gtk.Window, title string, err error) {
 	d.win.Present()
 }
 
+// reloadDialog explains why a plan stopped at its table check and offers the
+// plan that re-reads the table.
+func reloadDialog(parent *gtk.Window, title string, dk *disk.Disk, plan *ops.Plan, next func(*ops.Plan)) {
+	d := newDialog(parent, title, "Re-read Table", false)
+	d.text(fmt.Sprintf("Nothing was changed. The partition table on %s is not the one the kernel is using: it was changed while a partition on it was in use, so the partitions shown here are out of date.", dk.Path))
+	d.text("Re-reading the table brings the kernel, and this window, up to date with the disk. Nothing on the disk is written.").AddCSSClass("dim-label")
+	d.onOK(func() bool { next(plan); return true })
+	d.win.Present()
+	d.ok.GrabFocus()
+}
+
 // The dialogs below collect what each operation needs, build its plan and
 // hand it to confirmPlan via next.
 

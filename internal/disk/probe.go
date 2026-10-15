@@ -3,8 +3,11 @@ package disk
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -128,10 +131,33 @@ func toPartition(dev lsblkDevice) Partition {
 		Mountpoints: mountpoints(dev.Mountpoints),
 		ReadOnly:    dev.RO,
 	}
+	if p.Number == 0 {
+		p.Number = sysfsPartN(dev.Name)
+	}
 	for _, c := range dev.Children {
 		p.Holders = append(p.Holders, c.Name)
 	}
 	return p
+}
+
+// sysfsBlock is where the kernel lists block devices; tests point it
+// elsewhere.
+var sysfsBlock = "/sys/class/block"
+
+// sysfsPartN is the partition's number as the kernel has it, or 0. lsblk
+// reports PARTN from the udev database, and leaves it null when udev's rules
+// did not record ID_PART_ENTRY_NUMBER, as on Raven, and blkid cannot open the
+// disk without root.
+func sysfsPartN(name string) int {
+	b, err := os.ReadFile(filepath.Join(sysfsBlock, name, "partition"))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func mountpoints(in []*string) []string {
