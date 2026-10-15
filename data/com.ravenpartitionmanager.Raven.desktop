@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Partitions
+Comment=View and change disk partitions
+Exec=raven-partition-manager
+Icon=com.ravenpartitionmanager.Raven
+Terminal=false
+Type=Application
+Categories=System;Utility;GTK;
+Keywords=Partition;Disk;Format;Filesystem;GPT;MBR;Resize;
+StartupNotify=true
+StartupWMClass=raven-partition-manager

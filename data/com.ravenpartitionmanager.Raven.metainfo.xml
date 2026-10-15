@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.ravenpartitionmanager.Raven</id>
+  <name>Partitions</name>
+  <summary>View and change disk partitions</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>See every disk as a map of its partitions and free space, and create partition tables, create, delete, format and resize partitions. Every change shows the exact commands it will run first, and dry run is on until you turn it off.</p>
+  </description>
+  <launchable type="desktop-id">com.ravenpartitionmanager.Raven.desktop</launchable>
+  <provides><binary>raven-partition-manager</binary></provides>
+</component>

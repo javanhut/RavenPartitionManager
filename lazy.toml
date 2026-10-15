@@ -1,0 +1,58 @@
+# Raven Partition Manager's build interface for imlazy. Mirrors the Makefile.
+
+[settings]
+default = "build"
+
+# GTK 4, installed through rvn when pkg-config cannot find it. Same package
+# name as RVN_DEPS / PC_DEPS in the Makefile.
+[commands.deps]
+desc = "Install the system libraries the build links against, if missing"
+run = ["sh -c 'pkg-config --exists \"gtk4 >= 4.12\" || rvn install --repo-only -y gtk4'"]
+
+[commands.build]
+desc = "Build, optimised"
+dep = ["deps"]
+run = ["sh -c 'go build -trimpath -ldflags=\"-s -w\" -o bin/raven-partition-manager ./cmd/raven-partition-manager'"]
+alias = ["b"]
+
+[commands.run]
+desc = "Run the partition manager (dry run is on until switched off in the window)"
+dep = ["build"]
+run = ["./bin/raven-partition-manager"]
+
+[commands.probe]
+desc = "Print every disk, partition and free region the app sees"
+dep = ["build"]
+run = ["./bin/raven-partition-manager --probe"]
+
+[commands.test]
+desc = "Run the unit tests"
+run = ["go test ./internal/disk ./internal/ops"]
+alias = ["t"]
+
+[commands.check]
+desc = "gofmt, vet and tests"
+dep = ["deps"]
+run = ["sh -c 'test -z \"$(gofmt -l .)\"'", "go vet ./...", "go test ./..."]
+
+# The Makefile's install target depends on build, so `sudo make install`
+# builds as root. Here the build runs as you and only these steps escalate.
+[commands.install]
+desc = "Install to /usr/local"
+dep = ["build"]
+escalate = true
+writes = ["/usr/local/bin", "/usr/local/share"]
+run = [
+  "install -Dm755 bin/raven-partition-manager /usr/local/bin/raven-partition-manager",
+  "install -Dm644 data/com.ravenpartitionmanager.Raven.desktop /usr/local/share/applications/com.ravenpartitionmanager.Raven.desktop",
+  "install -Dm644 data/com.ravenpartitionmanager.Raven.metainfo.xml /usr/local/share/metainfo/com.ravenpartitionmanager.Raven.metainfo.xml",
+  "install -Dm644 data/icons/hicolor/scalable/apps/com.ravenpartitionmanager.Raven.svg /usr/local/share/icons/hicolor/scalable/apps/com.ravenpartitionmanager.Raven.svg",
+  "sh -c 'command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q /usr/local/share/applications || true'",
+  "sh -c 'command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf /usr/local/share/icons/hicolor || true'",
+]
+
+[commands.uninstall]
+desc = "Remove the installed copy"
+escalate = true
+writes = ["/usr/local/bin", "/usr/local/share"]
+run = ["make uninstall"]
