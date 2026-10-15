@@ -6,15 +6,17 @@ partition table, and create, delete, format and resize partitions.
 
 GTK 4 in Go, through [gotk4](https://github.com/diamondburned/gotk4).
 
-```
-make            # build to bin/raven-partition-manager
-make run        # run it
-make probe      # print every disk, partition and free region the app sees
-make test       # unit tests (no GTK needed)
-sudo make install
-```
+Built with [imlazy](lazy.toml):
 
-or with imlazy: `imlazy build`, `imlazy run`, `imlazy probe`, `imlazy install`.
+```
+imlazy build      # build to bin/raven-partition-manager (installs gtk4 with rvn if missing)
+imlazy run        # run it
+imlazy probe      # print every disk, partition and free region the app sees
+imlazy test       # unit tests (no GTK needed)
+imlazy check      # gofmt, vet and all tests
+imlazy install    # install to /usr/local; only the copying asks for root
+imlazy uninstall
+```
 
 The first build compiles the GTK bindings through cgo. That takes several
 minutes; later builds are fast.
@@ -45,7 +47,7 @@ minutes; later builds are fast.
 | Piece | What it does |
 |---|---|
 | `internal/disk` | Reads `lsblk --json --bytes`. Builds each disk's partitions and the free gaps between them, aligned to 1 MiB, with 1 MiB kept at each end of a GPT disk. |
-| `internal/ops` | Turns each operation into a `Plan` of commands. Renders the plan as a `set -e` shell script and runs it as root: through one `pkexec` prompt per operation, or directly when the app already runs as root. |
+| `internal/ops` | Turns each operation into a `Plan` of commands. Renders the plan as a `set -e` shell script and runs it as root: directly when the app already runs as root, otherwise in a Raven Terminal window under `sudo`, like other Raven apps. The window shows the commands, asks for the password once per operation, and stays open so you can read the result; the output also goes to the app's log. |
 | `internal/ui` | The window: disk picker, disk map (cairo), partition list, action bar and log. |
 
 | Operation | Commands |
@@ -74,5 +76,5 @@ XFS, FAT32, exFAT, NTFS and swap.
 ## Run-time dependencies
 
 GTK ≥ 4.12, util-linux (`lsblk`, `sfdisk`, `wipefs`, `partx`), `parted`,
-`udevadm`, polkit's `pkexec`, plus the mkfs and resize tools for each
+`udevadm`, `sudo` and `raven-terminal` (or foot, alacritty, kitty or xterm), plus the mkfs and resize tools for each
 filesystem you use (e2fsprogs, btrfs-progs, dosfstools, ntfs-3g, …).

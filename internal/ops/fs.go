@@ -186,16 +186,22 @@ var toolPackage = map[string]string{
 	"fatresize":  "fatresize",
 }
 
-// toolExists looks for a tool on PATH and in the sbin directories, which an
-// ordinary user's PATH may leave out but pkexec's includes.
+// toolExists reports whether lookTool finds the tool.
 func toolExists(name string) bool {
-	if _, err := exec.LookPath(name); err == nil {
-		return true
+	_, err := lookTool(name)
+	return err == nil
+}
+
+// lookTool looks for a tool on PATH and then in the sbin directories, which
+// an ordinary user's PATH may leave out but root's includes.
+func lookTool(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
 	}
 	for _, dir := range []string{"/usr/sbin", "/sbin", "/usr/local/sbin"} {
-		if _, err := exec.LookPath(dir + "/" + name); err == nil {
-			return true
+		if path, err := exec.LookPath(dir + "/" + name); err == nil {
+			return path, nil
 		}
 	}
-	return false
+	return "", exec.ErrNotFound
 }

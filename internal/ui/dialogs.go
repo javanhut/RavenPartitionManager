@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"math"
+	"os"
 
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
@@ -186,6 +187,9 @@ func confirmPlan(parent *gtk.Window, plan *ops.Plan, dryRun bool, apply func()) 
 		d.text("Dry run is on: these commands are only written to the log. Nothing on the disk changes.").AddCSSClass("dim-label")
 	} else {
 		warn := "These commands run as root as soon as you press Apply."
+		if os.Geteuid() != 0 {
+			warn = "When you press Apply, a terminal opens and asks for your password; these commands then run as root there."
+		}
 		if plan.Destructive {
 			warn += " This cannot be undone."
 		}
@@ -211,6 +215,7 @@ func confirmPlan(parent *gtk.Window, plan *ops.Plan, dryRun bool, apply func()) 
 
 func errorDialog(parent *gtk.Window, title string, err error) {
 	d := newDialog(parent, title, "Close", false)
+	d.cancel.SetVisible(false)
 	d.text(err.Error())
 	d.onOK(func() bool { return true })
 	d.win.Present()

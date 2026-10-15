@@ -273,3 +273,73 @@ func TestUnmount(t *testing.T) {
 		t.Error("a LUKS member is not mounted; Unmount should say so")
 	}
 }
+
+// fakeRoot puts a raven-terminal that runs its command in place and a sudo
+// with the given body first on PATH, so runInTerminal can run without a
+// display or a password.
+func fakeRoot(t *testing.T, sudoBody string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: plans run directly")
+	}
+	dir := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("raven-terminal", "[ \"$1\" = -e ] && shift\nexec \"$@\"\n")
+	write("sudo", sudoBody)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func runLive(t *testing.T, p *Plan) (string, error) {
+	var lines []string
+	err := (&Runner{}).Run(context.Background(), p, func(l string) { lines = append(lines, l) })
+	return strings.Join(lines, "\n"), err
+}
+
+func TestRunInTerminal(t *testing.T) {
+	fakeRoot(t, "[ \"$1\" = -- ] && shift\nexec \"$@\"\n")
+	marker := filepath.Join(t.TempDir(), "ran")
+	out, err := runLive(t, &Plan{Title: "t", Steps: []Step{{Desc: "touch", Argv: []string{"touch", marker}}}})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the plan did not run:\n%s", out)
+	}
+	if !strings.Contains(out, ">> touch") || !strings.Contains(out, ">> Done") {
+		t.Errorf("the plan's output should reach the log:\n%s", out)
+	}
+
+	out, err = runLive(t, &Plan{Title: "t", Steps: []Step{{Desc: "fails", Argv: []string{"false"}}}})
+	if err == nil || !strings.Contains(err.Error(), "exit status 1") {
+		t.Errorf("err = %v, want the plan's failure\n%s", err, out)
+	}
+}
+
+func TestRunInTerminalSudoRefused(t *testing.T) {
+	fakeRoot(t, "echo 'Sorry, try again.' >&2\nexit 1\n")
+	marker := filepath.Join(t.TempDir(), "ran")
+	out, err := runLive(t, &Plan{Title: "t", Steps: []Step{{Desc: "touch", Argv: []string{"touch", marker}}}})
+	if err == nil || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Errorf("err = %v, want sudo's refusal\n%s", err, out)
+	}
+	if !strings.Contains(out, "Sorry, try again.") {
+		t.Errorf("sudo's message should reach the log:\n%s", out)
+	}
+}
+
+func TestRunInTerminalClosedEarly(t *testing.T) {
+	fakeRoot(t, "exit 0\n")
+	// A terminal that is closed without running anything.
+	dir := filepath.SplitList(os.Getenv("PATH"))[0]
+	if err := os.WriteFile(filepath.Join(dir, "raven-terminal"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runLive(t, &Plan{Title: "t", Steps: []Step{{Desc: "x", Argv: []string{"true"}}}})
+	if err == nil || !strings.Contains(err.Error(), "closed before") {
+		t.Errorf("err = %v, want the terminal-closed error", err)
+	}
+}

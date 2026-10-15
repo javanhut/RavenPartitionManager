@@ -2,19 +2,24 @@ package ops
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Script renders a plan as a POSIX shell script that runs the steps in
 // order, echoing each one first, and stops at the first that fails. The
-// steps run in a subshell whose failure exits 1, so the script never exits
-// 126 or 127 itself and those codes can only mean pkexec refused.
+// steps run in a subshell whose failure exits 1. Every step prints a ">> "
+// line before it runs, which is how a failure inside the plan is told apart
+// from sudo refusing to start it.
 func (p *Plan) Script() string {
 	var b strings.Builder
 	b.WriteString("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n")
@@ -91,9 +96,11 @@ type Runner struct {
 }
 
 // Run executes the plan as root, sending its output line by line to out.
-// When the program is not already root the whole plan goes through one
-// pkexec call, so the user authenticates once per operation. In dry-run mode
-// it writes the script to out and runs nothing.
+// When the program already runs as root the plan runs directly. Otherwise it
+// runs in a terminal window under sudo, the way other Raven apps get root:
+// the window shows the commands, sudo asks for the password there, and the
+// user authenticates once per operation. In dry-run mode it writes the
+// commands to out and runs nothing.
 func (r *Runner) Run(ctx context.Context, p *Plan, out func(string)) error {
 	if r.DryRun {
 		out("[dry run] " + p.Title + " — nothing was changed. This would run as root:")
@@ -102,45 +109,174 @@ func (r *Runner) Run(ctx context.Context, p *Plan, out func(string)) error {
 		}
 		return nil
 	}
-
-	script := p.Script()
-	var cmd *exec.Cmd
+	out("Running: " + p.Title)
 	if os.Geteuid() == 0 {
-		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", script)
-	} else {
-		pkexec, err := exec.LookPath("pkexec")
-		if err != nil {
-			return fmt.Errorf("root is needed and pkexec is not installed; run the app as root instead")
-		}
-		cmd = exec.CommandContext(ctx, pkexec, "/bin/sh", "-c", script)
+		return runDirect(ctx, p, out)
 	}
+	return runInTerminal(ctx, p, out)
+}
+
+func runDirect(ctx context.Context, p *Plan, out func(string)) error {
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", p.Script())
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 	done := make(chan struct{})
 	go func() {
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			out(sc.Text())
-		}
+		sendLines(pr, out)
 		close(done)
 	}()
-	out("Running: " + p.Title)
 	err := cmd.Run()
 	pw.Close()
 	<-done
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && os.Geteuid() != 0 {
-			// pkexec's own exit codes for a refused or dismissed prompt.
-			switch ee.ExitCode() {
-			case 126:
-				return fmt.Errorf("authentication was cancelled; nothing was changed")
-			case 127:
-				return fmt.Errorf("not authorized to run as root; nothing was changed")
-			}
-		}
 		return fmt.Errorf("%s failed: %w", p.Title, err)
 	}
 	return nil
+}
+
+func sendLines(r io.Reader, out func(string)) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		out(sc.Text())
+	}
+}
+
+// terminals can show a command to the user and give sudo a tty to ask for
+// the password on, in order of preference, each with the flag that
+// introduces the command.
+var terminals = []struct{ name, flag string }{
+	{"raven-terminal", "-e"},
+	{"foot", ""},
+	{"alacritty", "-e"},
+	{"kitty", ""},
+	{"xterm", "-e"},
+}
+
+func terminalCommand(argv ...string) ([]string, error) {
+	for _, t := range terminals {
+		if path, err := exec.LookPath(t.name); err == nil {
+			cmd := []string{path}
+			if t.flag != "" {
+				cmd = append(cmd, t.flag)
+			}
+			return append(cmd, argv...), nil
+		}
+	}
+	return nil, errors.New("root is needed and no terminal is installed to ask for the sudo password in; install raven-terminal or run the app as root")
+}
+
+// terminalPoll is how often runInTerminal looks for the plan's exit status.
+var terminalPoll = 200 * time.Millisecond
+
+// runInTerminal runs the plan with sudo in a terminal window. The plan, its
+// output and its exit status live in a private temporary directory: the
+// window's script tees the output to a file and writes the status when sudo
+// returns, and this waits for that status rather than for the window, which
+// stays open until the user has read it.
+func runInTerminal(ctx context.Context, p *Plan, out func(string)) error {
+	sudo, err := lookTool("sudo")
+	if err != nil {
+		return errors.New("root is needed and sudo is not installed; run the app as root instead")
+	}
+	dir, err := os.MkdirTemp("", "raven-partition-manager-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	planPath := filepath.Join(dir, "plan.sh")
+	outPath := filepath.Join(dir, "output")
+	statusPath := filepath.Join(dir, "status")
+	if err := os.WriteFile(planPath, []byte(p.Script()), 0o600); err != nil {
+		return err
+	}
+	wrapper := filepath.Join(dir, "run.sh")
+	if err := os.WriteFile(wrapper, []byte(terminalScript(p, sudo, planPath, outPath, statusPath)), 0o600); err != nil {
+		return err
+	}
+	argv, err := terminalCommand("/bin/sh", wrapper)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("could not open a terminal: %w", err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(closed)
+	}()
+	out("Enter your password in the terminal window to continue.")
+
+	tick := time.NewTicker(terminalPoll)
+	defer tick.Stop()
+	finished := func() bool { _, err := os.Stat(statusPath); return err == nil }
+	for !finished() {
+		select {
+		case <-ctx.Done():
+			cmd.Process.Kill()
+			return ctx.Err()
+		case <-closed:
+			if !finished() {
+				return terminalClosed(outPath, out)
+			}
+		case <-tick.C:
+		}
+	}
+
+	output, _ := os.ReadFile(outPath)
+	sendLines(bytes.NewReader(output), out)
+	status, _ := os.ReadFile(statusPath)
+	code := strings.TrimSpace(string(status))
+	switch {
+	case code == "0":
+		return nil
+	case !planStarted(output):
+		return errors.New("sudo did not run the commands (wrong password, cancelled, or not allowed); nothing was changed")
+	default:
+		return fmt.Errorf("%s failed (exit status %s)", p.Title, code)
+	}
+}
+
+// planStarted reports whether the plan got as far as its first step, which
+// prints a ">> " line before it runs.
+func planStarted(output []byte) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.HasPrefix(line, ">> ") {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalClosed(outPath string, out func(string)) error {
+	output, _ := os.ReadFile(outPath)
+	sendLines(bytes.NewReader(output), out)
+	if planStarted(output) {
+		return errors.New("the terminal was closed while the commands were running, so they may have stopped part way; check the disk before going on")
+	}
+	return errors.New("the terminal was closed before the commands ran; nothing was changed")
+}
+
+// terminalScript is what the terminal window runs: it shows what is about to
+// happen, runs the plan under sudo with its output copied to outPath, records
+// the exit status in statusPath, and waits for Enter so the result can be
+// read.
+func terminalScript(p *Plan, sudo, planPath, outPath, statusPath string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "printf '%%s\\n\\n' %s\n", Quote("Raven Partition Manager: "+p.Title))
+	b.WriteString("echo 'These commands will run as root:'\n")
+	for _, line := range strings.Split(strings.TrimRight(p.Commands(), "\n"), "\n") {
+		fmt.Fprintf(&b, "printf '  %%s\\n' %s\n", Quote(line))
+	}
+	b.WriteString("echo\n")
+	tmp := statusPath + ".tmp"
+	fmt.Fprintf(&b, "{ %s -- /bin/sh %s; echo $? > %s; mv %s %s; } 2>&1 | tee %s\n",
+		Quote(sudo), Quote(planPath), Quote(tmp), Quote(tmp), Quote(statusPath), Quote(outPath))
+	b.WriteString("echo\n")
+	fmt.Fprintf(&b, "if [ \"$(cat %s 2>/dev/null)\" = 0 ]; then echo 'Finished. The partition manager has updated.'; else echo 'Not finished; nothing after the failure above was run.'; fi\n", Quote(statusPath))
+	b.WriteString("printf 'Press Enter to close this window… '\nread -r _\n")
+	return b.String()
 }
