@@ -14,6 +14,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"raven-partition-manager/internal/disk"
+	"raven-partition-manager/internal/ops"
 	"raven-partition-manager/internal/ui"
 )
 
@@ -84,6 +85,9 @@ func probe() int {
 			fmt.Printf("    %-16s %12.0f MiB  %10s  %-8s %-14s %s\n",
 				p.Name, start, disk.HumanSize(p.Size), p.FSType, p.Label, strings.Join(p.Mountpoints, ", "))
 		}
+	}
+	if msg := ops.MissingMessage(ops.MissingTools()); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
 	}
 	return 0
 }

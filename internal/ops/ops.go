@@ -35,7 +35,7 @@ type Plan struct {
 	Disk string
 }
 
-// TableType is a partition table layout parted can write.
+// TableType is a partition table layout the window offers.
 type TableType string
 
 const (
@@ -61,7 +61,9 @@ func NewTable(d *disk.Disk, t TableType) (*Plan, error) {
 		Destructive: true,
 		Steps: []Step{
 			{Desc: "Erase filesystem and partition table signatures", Argv: []string{"wipefs", "--all", d.Path}},
-			{Desc: "Write an empty " + tableName(t) + " partition table", Argv: []string{"parted", "--script", d.Path, "mklabel", string(t)}},
+			// The disk is not in use, so sfdisk can re-read the empty table
+			// itself, and refuses to write when it is.
+			{Desc: "Write an empty " + tableName(t) + " partition table", Argv: []string{"sfdisk", "--quiet", "--wipe", "always", d.Path}, Stdin: "label: " + sfdiskLabel(t) + "\n"},
 			settle(),
 		},
 	}, nil
@@ -76,11 +78,18 @@ type CreateRequest struct {
 	ESP   bool   // mark as EFI system partition (boot flag on MBR)
 }
 
-// Create adds a partition in free space and, if asked, formats it. parted
-// gives the new partition the lowest free number; before anything is
-// formatted the plan checks that the device with that number starts where the
-// partition was asked to, so a misprediction stops the plan instead of
-// formatting the wrong partition.
+// Create adds a partition in free space and, if asked, formats it. sfdisk
+// gives the new partition the lowest free number, which the plan predicts; it
+// cannot be told which number to use. Before anything is formatted the plan
+// checks that the device with that number starts where the partition was
+// asked to, so a misprediction stops the plan instead of formatting the wrong
+// partition.
+//
+// sfdisk writes only the table and the kernel is told about the one new
+// partition with partx, which works while other partitions on the disk are
+// mounted. Old signatures where the partition lands are wiped, so that a
+// filesystem left there from before is not mounted the moment the partition
+// appears.
 func Create(d *disk.Disk, req CreateRequest) (*Plan, error) {
 	if err := writable(d); err != nil {
 		return nil, err
@@ -118,44 +127,28 @@ func Create(d *disk.Disk, req CreateRequest) (*Plan, error) {
 		return nil, fmt.Errorf("could not read the partition numbers on %s, so the new partition's number cannot be predicted", d.Path)
 	}
 	path := d.PartitionPath(n)
-	end := req.Start + req.Size - 1 // parted's end is inclusive
 
-	mkpart := []string{"parted", "--script", "--align", "optimal", d.Path, "unit", "B", "mkpart"}
-	if d.Table == "gpt" {
-		name := req.Label
-		if name == "" {
-			name = "primary"
-		}
-		mkpart = append(mkpart, name)
-	} else {
-		mkpart = append(mkpart, "primary")
+	entry := fmt.Sprintf("start=%d, size=%d, type=%s", req.Start/d.SectorSize, req.Size/d.SectorSize, partType(d.Table, fs, req.ESP))
+	if d.Table == "gpt" && gptName(req.Label) {
+		entry += `, name="` + req.Label + `"`
 	}
-	if fs != nil && fs.PartedType != "" {
-		mkpart = append(mkpart, fs.PartedType)
+	steps := []Step{
+		tableCheck(d),
+		{
+			Desc:  fmt.Sprintf("Create partition %d (%s)", n, disk.HumanSize(req.Size)),
+			Argv:  []string{"sfdisk", "--quiet", "--no-reread", "--no-tell-kernel", "--wipe-partitions", "always", "--append", d.Path},
+			Stdin: entry + "\n",
+		},
+		{Desc: "Tell the kernel about it", Argv: []string{"partx", "--add", "--nr", strconv.Itoa(n), d.Path}},
+		settle(),
+		waitForNode(path),
+		{
+			Desc: fmt.Sprintf("Check that %s is the new partition", path),
+			Argv: []string{"grep", "-qx", strconv.FormatUint(req.Start/512, 10), sysfsStart(path)},
+		},
 	}
-	mkpart = append(mkpart, fmt.Sprintf("%dB", req.Start), fmt.Sprintf("%dB", end))
-
-	desc := fmt.Sprintf("Create partition %d (%s)", n, disk.HumanSize(req.Size))
-	steps := []Step{tableCheck(d), {Desc: desc, Argv: mkpart}}
-	if req.ESP {
-		flag := "esp"
-		if d.Table != "gpt" {
-			flag = "boot"
-		}
-		steps = append(steps, Step{
-			Desc: "Mark it as the EFI system partition",
-			Argv: []string{"parted", "--script", d.Path, "set", strconv.Itoa(n), flag, "on"},
-		})
-	}
-	steps = append(steps, settle())
 	if fs != nil {
-		steps = append(steps,
-			Step{
-				Desc: fmt.Sprintf("Check that %s is the new partition", path),
-				Argv: []string{"grep", "-qx", strconv.FormatUint(req.Start/512, 10), sysfsStart(path)},
-			},
-			Step{Desc: "Format as " + fs.Name, Argv: fs.Mkfs(path, req.Label)},
-		)
+		steps = append(steps, Step{Desc: "Format as " + fs.Name, Argv: fs.Mkfs(path, req.Label)})
 	}
 
 	summary := fmt.Sprintf("A %s partition will be created on %s as %s.", disk.HumanSize(req.Size), d.Path, path)
@@ -191,7 +184,8 @@ func Delete(d *disk.Disk, p *disk.Partition) (*Plan, error) {
 		Destructive: true,
 		Steps: []Step{
 			tableCheck(d),
-			{Desc: fmt.Sprintf("Remove partition %d", p.Number), Argv: []string{"parted", "--script", d.Path, "rm", strconv.Itoa(p.Number)}},
+			{Desc: fmt.Sprintf("Remove partition %d", p.Number), Argv: []string{"sfdisk", "--quiet", "--no-reread", "--no-tell-kernel", "--delete", d.Path, strconv.Itoa(p.Number)}},
+			{Desc: "Tell the kernel it is gone", Argv: []string{"partx", "--delete", "--nr", strconv.Itoa(p.Number), d.Path}},
 			settle(),
 		},
 		Disk: d.Path,
@@ -372,7 +366,7 @@ func Resize(d *disk.Disk, p *disk.Partition, newSize uint64) (*Plan, error) {
 	sectors := newSize / d.SectorSize
 	table := Step{
 		Desc:  fmt.Sprintf("Set partition %d to %s", p.Number, disk.HumanSize(newSize)),
-		Argv:  []string{"sfdisk", "--no-reread", "-N", strconv.Itoa(p.Number), d.Path},
+		Argv:  []string{"sfdisk", "--quiet", "--no-reread", "--no-tell-kernel", "-N", strconv.Itoa(p.Number), d.Path},
 		Stdin: fmt.Sprintf(",%d\n", sectors),
 	}
 	tell := Step{Desc: "Tell the kernel about the new size", Argv: []string{"partx", "--update", "--nr", strconv.Itoa(p.Number), d.Path}}
@@ -422,7 +416,7 @@ func fitsInFree(d *disk.Disk, start, size uint64) bool {
 
 // tableCheck is the first step of every plan that edits single entries of a
 // partition table. The window shows the kernel's view of the disk, while
-// parted, sfdisk and fatresize edit the table on the disk. The two part ways
+// sfdisk and fatresize edit the table on the disk. The two part ways
 // when the table is rewritten while a partition on it is in use: the kernel
 // keeps the old partition until it is free. Editing a table the window does
 // not show would put a partition over a mounted one or remove the wrong one,
@@ -441,8 +435,8 @@ func tableCheck(d *disk.Disk) Step {
 	msg := fmt.Sprintf("%s the partition table on %s is not the one the kernel is using; it was changed while a partition on it was in use. "+
 		"Nothing was changed. Unmount everything on %s and re-read its partition table, then try again.", mismatchMarker, d.Path, d.Path)
 	script := `p=$(partx -g -o NR,START,SECTORS "$1") || exit 1; ` +
-		`t=$(printf '%s\n' "$p" | awk 'NF { printf "%s%s:%s:%s", (n++ ? " " : ""), $1, $2, $3 }'); ` +
-		`case "$t" in $2) ;; *) echo "$3" >&2; exit 1 ;; esac`
+		`printf '%s\n' "$p" | { t=; while read -r n s c; do [ -z "$n" ] || t="$t${t:+ }$n:$s:$c"; done; ` +
+		`case "$t" in $2) ;; *) echo "$3" >&2; exit 1 ;; esac; }`
 	return Step{
 		Desc: fmt.Sprintf("Check that the partition table on %s is the one shown", d.Path),
 		Argv: []string{"sh", "-c", script, "sh", d.Path, strings.Join(want, " "), msg},
@@ -458,8 +452,53 @@ const mismatchMarker = "Partition table mismatch:"
 // kernel back in line with the disk.
 var ErrTableMismatch = errors.New("nothing was changed: the partition table on the disk is not the one the kernel is using, because it was changed while a partition on it was in use")
 
+// settle waits for udev to finish with the changes just made. udev is
+// optional on Raven (raven-udev boots without it, leaving device nodes to the
+// kernel's devtmpfs), so without udevadm there is nothing to wait for. A
+// settle that times out is no sign the change failed, so it never stops a
+// plan; steps that need a device node wait for it with waitForNode.
 func settle() Step {
-	return Step{Desc: "Wait for the device nodes to update", Argv: []string{"udevadm", "settle"}}
+	return Step{
+		Desc: "Wait for udev, if it is running",
+		Argv: []string{"sh", "-c", "command -v udevadm >/dev/null 2>&1 || exit 0; udevadm settle --timeout=30 || true"},
+	}
+}
+
+// waitForNode waits up to ten seconds for a partition's device node to
+// appear, made by udev or devtmpfs once partx has told the kernel about it.
+func waitForNode(path string) Step {
+	return Step{
+		Desc: "Wait for " + path,
+		Argv: []string{"sh", "-c", `i=0; until [ -b "$1" ]; do i=$((i + 1)); [ "$i" -le 100 ] || { echo "$1 did not appear" >&2; exit 1; }; sleep 0.1; done`, "sh", path},
+	}
+}
+
+// gptName reports whether a label can also be the GPT partition name: at
+// most 36 UTF-16 code units, and no double quote, which ends the name in
+// sfdisk's input. A label that cannot is still the filesystem's label; the
+// partition is left unnamed.
+func gptName(label string) bool {
+	if label == "" || strings.ContainsAny(label, "\"\\") {
+		return false
+	}
+	units := 0
+	for _, r := range label {
+		if r < 0x20 {
+			return false
+		}
+		units++
+		if r > 0xffff {
+			units++
+		}
+	}
+	return units <= 36
+}
+
+func sfdiskLabel(t TableType) string {
+	if t == TableMSDOS {
+		return "dos"
+	}
+	return "gpt"
 }
 
 func sysfsStart(devPath string) string {

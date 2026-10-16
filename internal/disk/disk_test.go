@@ -119,6 +119,29 @@ func TestRegionsExtended(t *testing.T) {
 	}
 }
 
+// Without PARTTYPE from udev, an MBR extended partition is known by the 1 KiB
+// stub the kernel shows for it.
+func TestParseExtendedWithoutType(t *testing.T) {
+	const js = `{"blockdevices":[
+	 {"name":"sdz","path":"/dev/sdz","type":"disk","size":1048576000,"pttype":"dos","log-sec":512,
+	  "children":[
+	   {"name":"sdz1","path":"/dev/sdz1","type":"part","size":104857600,"start":2048,"partn":1,"parttype":null},
+	   {"name":"sdz2","path":"/dev/sdz2","type":"part","size":1024,"start":206848,"partn":2,"parttype":null},
+	   {"name":"sdz5","path":"/dev/sdz5","type":"part","size":512,"start":208896,"partn":5,"parttype":null}
+	  ]}]}`
+	disks, err := Parse([]byte(js))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := disks[0]
+	if !d.Partition(2).Extended() {
+		t.Error("sdz2 should be taken for the extended partition")
+	}
+	if d.Partition(1).Extended() || d.Partition(5).Extended() {
+		t.Error("only a primary of a sector or two is an extended partition")
+	}
+}
+
 func TestPartitionPath(t *testing.T) {
 	cases := map[string]string{
 		"/dev/sda":     "/dev/sda3",

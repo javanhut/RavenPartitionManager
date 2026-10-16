@@ -2,11 +2,13 @@ package ops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -43,8 +45,8 @@ func TestNewTableRefusesBusyDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := argvs(p)
-	if got[0] != "wipefs --all /dev/sdz" || got[1] != "parted --script /dev/sdz mklabel msdos" {
-		t.Errorf("steps = %q", got)
+	if got[0] != "wipefs --all /dev/sdz" || got[1] != "sfdisk --quiet --wipe always /dev/sdz" || p.Steps[1].Stdin != "label: dos\n" {
+		t.Errorf("steps = %q, stdin %q", got, p.Steps[1].Stdin)
 	}
 	if !p.Destructive {
 		t.Error("a new table erases the disk")
@@ -67,13 +69,18 @@ func TestCreate(t *testing.T) {
 	}
 	got = got[1:]
 	want := []string{
-		"parted --script --align optimal /dev/sdz unit B mkpart home ext4 210763776B 263192575B",
-		"udevadm settle",
+		"sfdisk --quiet --no-reread --no-tell-kernel --wipe-partitions always --append /dev/sdz",
+		"partx --add --nr 4 /dev/sdz",
+		strings.Join(settle().Argv, " "),
+		strings.Join(waitForNode("/dev/sdz4").Argv, " "),
 		"grep -qx 411648 /sys/class/block/sdz4/start",
 		"mkfs.ext4 -F -L home /dev/sdz4",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("steps:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if in := p.Steps[1].Stdin; in != "start=411648, size=102400, type="+gptLinux+`, name="home"`+"\n" {
+		t.Errorf("sfdisk input = %q", in)
 	}
 
 	if _, err := Create(d, CreateRequest{Start: 250 * disk.MiB, Size: 100 * disk.MiB}); err == nil {
@@ -96,8 +103,8 @@ func TestDeleteAndFormatRefuseMounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if argvs(p)[1] != "parted --script /dev/sdz rm 1" {
-		t.Errorf("steps = %q", argvs(p))
+	if got := argvs(p); got[1] != "sfdisk --quiet --no-reread --no-tell-kernel --delete /dev/sdz 1" || got[2] != "partx --delete --nr 1 /dev/sdz" {
+		t.Errorf("steps = %q", got)
 	}
 }
 
@@ -123,7 +130,7 @@ func TestResize(t *testing.T) {
 		t.Fatal(err)
 	}
 	gs := argvs(grow)[1:]
-	if gs[0] != "sfdisk --no-reread -N 3 /dev/sdz" || grow.Steps[1].Stdin != ",409600\n" {
+	if gs[0] != "sfdisk --quiet --no-reread --no-tell-kernel -N 3 /dev/sdz" || grow.Steps[1].Stdin != ",409600\n" {
 		t.Errorf("grow should change the table first: %q stdin %q", gs, grow.Steps[0].Stdin)
 	}
 	if gs[len(gs)-1] != "resize2fs /dev/sdz3" {
@@ -145,6 +152,134 @@ func TestResize(t *testing.T) {
 	d.Partitions[2].FSType = "btrfs"
 	if _, err := Limits(d, p3); err == nil {
 		t.Error("btrfs should not be resizable offline")
+	}
+}
+
+// sfdiskEntry is one partition as `sfdisk --json` reports it.
+type sfdiskEntry struct {
+	Node  string `json:"node"`
+	Start uint64 `json:"start"`
+	Size  uint64 `json:"size"`
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+}
+
+// TestPlansOnImage runs the table-writing steps of each plan (sfdisk and
+// wipefs, which work on image files as on disks) and reads the table back,
+// creating partitions into a gap to check that sfdisk numbers them the way
+// NextPartitionNumber predicts.
+func TestPlansOnImage(t *testing.T) {
+	for _, tool := range []string{"sfdisk", "wipefs"} {
+		if !toolExists(tool) {
+			t.Skip(tool + " not installed")
+		}
+	}
+	for _, table := range []TableType{TableGPT, TableMSDOS} {
+		t.Run(string(table), func(t *testing.T) {
+			img := filepath.Join(t.TempDir(), "disk.img")
+			if err := os.WriteFile(img, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Truncate(img, 64*disk.MiB); err != nil {
+				t.Fatal(err)
+			}
+			d := &disk.Disk{Path: img, Size: 64 * disk.MiB, SectorSize: 512}
+			apply := func(p *Plan, err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, s := range p.Steps {
+					if s.Argv[0] != "sfdisk" && s.Argv[0] != "wipefs" {
+						continue
+					}
+					cmd := exec.Command(s.Argv[0], s.Argv[1:]...)
+					cmd.Stdin = strings.NewReader(s.Stdin)
+					if out, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("%s: %v\n%s", s.command(), err, out)
+					}
+				}
+			}
+			// read loads the table into d the way the kernel would show it.
+			read := func() map[int]sfdiskEntry {
+				t.Helper()
+				out, err := exec.Command("sfdisk", "--json", img).Output()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var j struct {
+					Table struct {
+						Label      string        `json:"label"`
+						Partitions []sfdiskEntry `json:"partitions"`
+					} `json:"partitiontable"`
+				}
+				if err := json.Unmarshal(out, &j); err != nil {
+					t.Fatal(err)
+				}
+				d.Table = j.Table.Label
+				d.Partitions = nil
+				got := map[int]sfdiskEntry{}
+				for _, e := range j.Table.Partitions {
+					n, _ := strconv.Atoi(strings.TrimPrefix(e.Node, img))
+					got[n] = e
+					d.Partitions = append(d.Partitions, disk.Partition{Number: n, Start: e.Start * 512, Size: e.Size * 512})
+				}
+				return got
+			}
+
+			apply(NewTable(d, table))
+			if got := read(); len(got) != 0 || d.Table != sfdiskLabel(table) {
+				t.Fatalf("new table: label %q, partitions %+v", d.Table, got)
+			}
+			for _, start := range []uint64{1, 9, 17} {
+				apply(Create(d, CreateRequest{Start: start * disk.MiB, Size: 8 * disk.MiB, Label: "data"}))
+				read()
+			}
+			apply(Delete(d, d.Partition(2)))
+			read()
+			if n := d.NextPartitionNumber(); n != 2 {
+				t.Fatalf("next = %d after deleting 2", n)
+			}
+			apply(Create(d, CreateRequest{Start: 40 * disk.MiB, Size: 4 * disk.MiB, Label: "late"}))
+			got := read()
+			p2 := got[2]
+			if p2.Start != 40*disk.MiB/512 || p2.Size != 4*disk.MiB/512 {
+				t.Errorf("sfdisk did not put the new partition in slot 2: %+v", got)
+			}
+			if want := partType(d.Table, nil, false); !strings.EqualFold(p2.Type, want) {
+				t.Errorf("type = %q, want %q", p2.Type, want)
+			}
+			if table == TableGPT && p2.Name != "late" {
+				t.Errorf("GPT name = %q, want the label", p2.Name)
+			}
+			apply(Resize(d, d.Partition(3), 12*disk.MiB))
+			if got := read(); got[3].Size != 12*disk.MiB/512 || got[3].Start != 17*disk.MiB/512 {
+				t.Errorf("resize: %+v", got[3])
+			}
+		})
+	}
+}
+
+func TestGPTName(t *testing.T) {
+	for label, want := range map[string]bool{
+		"home": true, "": false, `say "hi"`: false, `a\b`: false, "tab\there": false,
+		strings.Repeat("x", 36): true, strings.Repeat("x", 37): false, strings.Repeat("é", 36): true,
+		strings.Repeat("😀", 18): true, strings.Repeat("😀", 19): false,
+	} {
+		if got := gptName(label); got != want {
+			t.Errorf("gptName(%q) = %v, want %v", label, got, want)
+		}
+	}
+}
+
+func TestMissingMessage(t *testing.T) {
+	if MissingMessage(nil) != "" {
+		t.Error("nothing missing should say nothing")
+	}
+	msg := MissingMessage([]Tool{requiredTools[0], requiredTools[1], {"raven-terminal", "", ""}, {"sudo", "sudo", ""}})
+	want := "sfdisk, partx, raven-terminal and sudo are not installed, so changes can only be simulated. Install with: rvn install util-linux sudo"
+	if msg != want {
+		t.Errorf("got  %q\nwant %q", msg, want)
 	}
 }
 
@@ -400,7 +535,7 @@ func TestReloadTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"umount --all-targets /dev/sdz2", "blockdev --rereadpt /dev/sdz", "udevadm settle"}
+	want := []string{"umount --all-targets /dev/sdz2", "blockdev --rereadpt /dev/sdz", strings.Join(settle().Argv, " ")}
 	if got := argvs(p); strings.Join(got, "\n") != strings.Join(want, "\n") || p.Destructive {
 		t.Errorf("steps = %q, destructive = %v; want the mounted sdz2 unmounted, then the re-read", got, p.Destructive)
 	}

@@ -10,12 +10,13 @@ import (
 
 // Filesystem is one filesystem the window can create.
 type Filesystem struct {
-	ID         string // also the lsblk FSTYPE for most
-	Name       string
-	Tool       string // mkfs binary; the filesystem is offered only when it is installed
-	PartedType string // fs-type hint for parted mkpart, which sets the partition type
-	MaxLabel   int    // label length limit in bytes
-	mkfs       func(dev, label string) []string
+	ID       string // also the lsblk FSTYPE for most
+	Name     string
+	Tool     string // mkfs binary; the filesystem is offered only when it is installed
+	MBRType  string // partition type byte for sfdisk on an MBR table
+	GPTType  string // partition type GUID for sfdisk on a GPT
+	MaxLabel int    // label length limit in bytes
+	mkfs     func(dev, label string) []string
 }
 
 // Mkfs is the command that formats dev with this filesystem.
@@ -42,34 +43,62 @@ func withLabel(argv []string, flag, label string) []string {
 	return argv
 }
 
+// Partition type GUIDs for GPT.
+const (
+	gptLinux     = "0FC63DAF-8483-4772-8E79-3D69D8477DE4" // Linux filesystem
+	gptSwap      = "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F" // Linux swap
+	gptBasicData = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" // Microsoft basic data: FAT, exFAT, NTFS
+	gptESP       = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" // EFI system partition
+)
+
+// partType is the type sfdisk gives a new partition: the filesystem's, a
+// Linux filesystem when it is left unformatted, or the EFI system partition
+// type (0xef on MBR, which UEFI firmware looks for there).
+func partType(table string, fs *Filesystem, esp bool) string {
+	gpt := table == "gpt"
+	switch {
+	case esp && gpt:
+		return gptESP
+	case esp:
+		return "ef"
+	case fs == nil && gpt:
+		return gptLinux
+	case fs == nil:
+		return "83"
+	case gpt:
+		return fs.GPTType
+	}
+	return fs.MBRType
+}
+
 // Filesystems is every filesystem the window knows how to create, in menu
 // order.
 var Filesystems = []*Filesystem{
-	{ID: "ext4", Name: "ext4", Tool: "mkfs.ext4", PartedType: "ext4", MaxLabel: 16,
+	{ID: "ext4", Name: "ext4", Tool: "mkfs.ext4", MBRType: "83", GPTType: gptLinux, MaxLabel: 16,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkfs.ext4", "-F"}, "-L", label), dev)
 		}},
-	{ID: "btrfs", Name: "Btrfs", Tool: "mkfs.btrfs", PartedType: "btrfs", MaxLabel: 255,
+	{ID: "btrfs", Name: "Btrfs", Tool: "mkfs.btrfs", MBRType: "83", GPTType: gptLinux, MaxLabel: 255,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkfs.btrfs", "-f"}, "-L", label), dev)
 		}},
-	{ID: "xfs", Name: "XFS", Tool: "mkfs.xfs", PartedType: "xfs", MaxLabel: 12,
+	{ID: "xfs", Name: "XFS", Tool: "mkfs.xfs", MBRType: "83", GPTType: gptLinux, MaxLabel: 12,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkfs.xfs", "-f"}, "-L", label), dev)
 		}},
-	{ID: "fat32", Name: "FAT32", Tool: "mkfs.fat", PartedType: "fat32", MaxLabel: 11,
+	{ID: "fat32", Name: "FAT32", Tool: "mkfs.fat", MBRType: "c", GPTType: gptBasicData, MaxLabel: 11,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkfs.fat", "-F", "32"}, "-n", label), dev)
 		}},
-	{ID: "exfat", Name: "exFAT", Tool: "mkfs.exfat", PartedType: "", MaxLabel: 15,
+	{ID: "exfat", Name: "exFAT", Tool: "mkfs.exfat", MBRType: "7", GPTType: gptBasicData, MaxLabel: 15,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkfs.exfat"}, "-L", label), dev)
 		}},
-	{ID: "ntfs", Name: "NTFS", Tool: "mkfs.ntfs", PartedType: "ntfs", MaxLabel: 128,
+	{ID: "ntfs", Name: "NTFS", Tool: "mkfs.ntfs", MBRType: "7", GPTType: gptBasicData, MaxLabel: 128,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkfs.ntfs", "--fast", "--force"}, "-L", label), dev)
 		}},
-	{ID: "swap", Name: "Linux swap", Tool: "mkswap", PartedType: "linux-swap", MaxLabel: 15,
+	{ID: "swap", Name: "Linux swap", Tool: "mkswap", MBRType: "82", GPTType: gptSwap, MaxLabel: 15,
 		mkfs: func(dev, label string) []string {
 			return append(withLabel([]string{"mkswap"}, "-L", label), dev)
 		}},
@@ -140,8 +169,8 @@ var resizers = map[string]*fsResizer{
 			}}
 		},
 	},
-	// fatresize (libparted) resizes the FAT and then sets the partition's new
-	// end itself, committing the table only after the filesystem resize
+	// fatresize (built on libparted, not the parted program) resizes the FAT
+	// and then sets the partition's new end itself, committing the table only after the filesystem resize
 	// succeeded. Given the whole disk and -n it edits that table entry; a
 	// plain number is a size in bytes; -f answers libparted's questions.
 	"vfat": {

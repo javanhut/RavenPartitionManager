@@ -35,6 +35,7 @@ type Window struct {
 	settingDisks bool
 	dryRun       *gtk.Switch
 	modeBanner   *gtk.Label
+	toolsBanner  *gtk.Label
 	info         *gtk.Label
 	dmap         *diskMap
 	list         *gtk.ListBox
@@ -95,6 +96,13 @@ func NewWindow(app *gtk.Application) *Window {
 	w.modeBanner.AddCSSClass("mode-banner")
 	w.modeBanner.SetWrap(true)
 	body.Append(w.modeBanner)
+
+	w.toolsBanner = gtk.NewLabel("")
+	w.toolsBanner.AddCSSClass("tools-banner")
+	w.toolsBanner.SetWrap(true)
+	w.toolsBanner.SetSelectable(true)
+	w.toolsBanner.SetVisible(false)
+	body.Append(w.toolsBanner)
 
 	top := gtk.NewBox(gtk.OrientationVertical, 10)
 	top.AddCSSClass("content")
@@ -266,6 +274,7 @@ func (w *Window) selectedRegion() *disk.Region {
 // refresh reads the disks again, keeping the same disk and region selected
 // when they still exist.
 func (w *Window) refresh() {
+	w.checkTools()
 	var keepDisk string
 	var keepStart uint64
 	if d := w.current(); d != nil {
@@ -528,6 +537,22 @@ func (w *Window) setStatus(text string) {
 	w.status.SetVisible(text != "")
 }
 
+// checkTools says which of the tools every change needs are missing, and
+// keeps dry run on until they are installed. Refresh checks again.
+func (w *Window) checkTools() {
+	msg := ops.MissingMessage(ops.MissingTools())
+	if msg != "" {
+		msg += "\nPress Refresh once they are installed."
+		w.dryRun.SetActive(true)
+		w.dryRun.SetTooltipText("Changes need the tools named above")
+	} else {
+		w.dryRun.SetTooltipText("When on, operations only log the commands they would run")
+	}
+	w.dryRun.SetSensitive(msg == "")
+	w.toolsBanner.SetText(msg)
+	w.toolsBanner.SetVisible(msg != "")
+}
+
 func (w *Window) updateMode() {
 	w.runner.DryRun = w.dryRun.Active()
 	if w.runner.DryRun {
@@ -669,6 +694,7 @@ const css = `
 .mode-banner { padding: 6px 16px; font-size: 0.92em; }
 .mode-banner.dry { background: alpha(#3584e4, 0.14); }
 .mode-banner.live { background: alpha(#e01b24, 0.22); font-weight: bold; }
+.tools-banner { padding: 6px 16px; font-size: 0.92em; background: alpha(#e5a50a, 0.22); }
 .columns { padding: 6px 10px; }
 .column-header { font-weight: bold; opacity: 0.65; }
 .log-heading { padding: 8px 12px 0 12px; }

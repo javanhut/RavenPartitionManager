@@ -9,7 +9,7 @@ import (
 )
 
 // MiB is the alignment unit for every region and offset this package hands
-// out, which is what parted's "optimal" alignment settles on for nearly every
+// out, which is what sfdisk and parted align partitions to for nearly every
 // disk.
 const MiB = 1 << 20
 
@@ -135,7 +135,7 @@ func (d *Disk) CanAddPartition() (bool, string) {
 	return false, fmt.Sprintf("%q partition tables are not supported", d.Table)
 }
 
-// NextPartitionNumber is the number parted gives the next partition it
+// NextPartitionNumber is the number sfdisk gives the next partition it
 // creates: the lowest unused one (only 1-4 on MBR, since only primaries are
 // created here). It is 0 when a partition's own number is unknown, since the
 // lowest free number cannot be told then.

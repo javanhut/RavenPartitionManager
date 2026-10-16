@@ -109,6 +109,9 @@ func (r *Runner) Run(ctx context.Context, p *Plan, out func(string)) error {
 		}
 		return nil
 	}
+	if msg := MissingMessage(MissingTools()); msg != "" {
+		return errors.New("nothing was changed: " + msg)
+	}
 	out("Running: " + p.Title)
 	mismatch := false
 	watch := func(line string) {

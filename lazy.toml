@@ -5,8 +5,9 @@
 default = "build"
 
 # GTK 4 is linked through cgo by gotk4; installed through rvn when
-# pkg-config cannot find it. parted, util-linux (lsblk, sfdisk, wipefs,
-# partx), sudo and a terminal (raven-terminal) are needed at run time.
+# pkg-config cannot find it. util-linux (lsblk, sfdisk, partx, blockdev,
+# wipefs), sudo and a terminal (raven-terminal) are needed at run time; the
+# window names any that are missing.
 [commands.deps]
 desc = "Install the system libraries the build links against, if missing"
 run = ["sh -c 'pkg-config --exists \"gtk4 >= 4.12\" || rvn install --repo-only -y gtk4'"]

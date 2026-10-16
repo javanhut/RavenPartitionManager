@@ -112,7 +112,23 @@ func toDisk(dev lsblkDevice) Disk {
 		}
 	}
 	sort.Slice(d.Partitions, func(i, j int) bool { return d.Partitions[i].Number < d.Partitions[j].Number })
+	if d.Table == "dos" {
+		for i := range d.Partitions {
+			markExtended(&d.Partitions[i])
+		}
+	}
 	return d
+}
+
+// markExtended gives an MBR partition of unknown type the extended type when
+// the kernel shows it the way it shows every extended partition: a primary
+// of a sector or two, enough for the boot record that starts the chain of
+// logical partitions. lsblk takes PARTTYPE from udev, which on Raven does not
+// record it.
+func markExtended(p *Partition) {
+	if p.TypeCode == "" && p.Number >= 1 && p.Number <= 4 && p.Size <= 1024 {
+		p.TypeCode = "0x5"
+	}
 }
 
 func toPartition(dev lsblkDevice) Partition {
